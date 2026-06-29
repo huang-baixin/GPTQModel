@@ -18,10 +18,11 @@ from ..nn_modules.hooked_linear import StopForward
 from ..utils.attn_mask import normalize_seq_mask
 from ..utils.device import get_device
 from ..utils.env import env_flag
+from ..utils.inspect import get_supported_kwargs
 from ..utils.logger import setup_logger
 from ..utils.model import move_to, nested_move_to
 from ..utils.safe import ThreadSafe
-from ..utils.torch import ALL_DEVICES, CPU, torch_sync
+from ..utils.torch import ALL_DEVICES, CPU, HAS_NPU, torch_sync
 
 
 USE_TORCH_REPLICATE = env_flag("GPTQMODEL_USE_TORCH_REPLICATE", True)
@@ -93,6 +94,10 @@ def device_ctx(dev: Optional[torch.device | "DEVICE"]):
         return
     if dev.type == "xpu" and hasattr(torch, "xpu"):
         with torch.xpu.device(dev.index):  # type: ignore[attr-defined]
+            yield
+        return
+    if dev.type == "npu" and HAS_NPU:
+        with torch.npu.device(dev.index):  # type: ignore[attr-defined]
             yield
         return
 
@@ -359,11 +364,13 @@ def forward_batch_worker(
     attention_mask: Optional[torch.Tensor],
     position_ids: Optional[torch.Tensor],
     *,
+    gptq_model=None,
     support_batch_quantize: bool,
     is_lm_head_module: bool,
     need_output: bool,
     reuse_kv: bool,
     prev_kv,
+    write_shared_kv_cache: bool = False,
 ):
     processor._set_current_batch_index(batch_index)
     module_device = getattr(module, "_gptqmodule_device_hint", None) or get_device(module)
@@ -378,8 +385,12 @@ def forward_batch_worker(
         attn_tensor = move_to(attention_mask, device=module_device)
 
     additional_inputs: Dict[str, torch.Tensor] = {}
-    if support_batch_quantize and attn_tensor is not None:
-        additional_inputs["attention_mask"] = attn_tensor
+    accepts_var_kw, allowed_kwargs = get_supported_kwargs(module.forward)
+    supports_attention_mask = accepts_var_kw or allowed_kwargs is None or "attention_mask" in allowed_kwargs
+    if supports_attention_mask:
+        # Some layers, such as ChatGLM blocks, still require the kwarg even
+        # when the effective mask is `None`.
+        additional_inputs["attention_mask"] = attn_tensor if support_batch_quantize else None
 
     if position_ids is not None:
         additional_inputs["position_ids"] = move_to(position_ids, device=module_device)
@@ -401,6 +412,13 @@ def forward_batch_worker(
 
     # TODO: some models does not honor generate config.use_cache property so we are forced to hack this to false
     additional_inputs["use_cache"] = False
+    if gptq_model is not None:
+        additional_inputs = gptq_model.prepare_layer_replay_kwargs(
+            layer=module,
+            layer_input=inputs,
+            additional_inputs=additional_inputs,
+            target_device=module_device,
+        )
 
     module_output = None
     kv_next = None
@@ -416,10 +434,14 @@ def forward_batch_worker(
             mask_tls.value = None
         processor._set_current_batch_index(None)
 
-    if reuse_kv and module_output is not None and isinstance(module_output, tuple) and len(module_output) > 0:
+    if (reuse_kv or write_shared_kv_cache) and module_output is not None and isinstance(module_output, tuple) and len(module_output) > 0:
         kv_next = module_output[-1]
 
-    result_output = module_output if need_output else None
+    result_output = None
+    if need_output and module_output is not None:
+        # Replay only consumes the hidden-state tensor that feeds the next
+        # layer.
+        result_output = module_output[0] if isinstance(module_output, tuple) else module_output
 
     # Promptly release VRAM to reduce peak memory usage.
     del inputs

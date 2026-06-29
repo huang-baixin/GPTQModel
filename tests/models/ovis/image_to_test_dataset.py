@@ -2,11 +2,18 @@
 # SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-
 from gptqmodel.models.definitions.base_qwen2_5_omni import BaseQwen2_5_OmniGPTQ
 from gptqmodel.models.definitions.base_qwen2_vl import BaseQwen2VLGPTQ
+from gptqmodel.models.definitions.ernie4_5_vl_moe import Ernie4_5_VLMoeQModel
+from gptqmodel.models.definitions.interns1 import InternS1QModel
+from gptqmodel.models.definitions.internvl_chat import InternVLChatQModel
+from gptqmodel.models.definitions.minicpm_o import MiniCPMOQModel
+from gptqmodel.models.definitions.minicpmv import MiniCPMVQModel
+from gptqmodel.models.definitions.minicpmv_4_6 import MiniCPMV4_6QModel
 from gptqmodel.models.definitions.ovis import OvisQModel
 from gptqmodel.models.definitions.ovis2 import Ovis2QModel
+from gptqmodel.models.definitions.ovis2_5 import Ovis2_5QModel
+from gptqmodel.models.definitions.ovis2_6_moe import Ovis2_6_MoeQModel
 from gptqmodel.models.definitions.qwen3_vl import Qwen3_VLQModel
 
 
@@ -90,13 +97,25 @@ def get_calib_dataset(model):
     if isinstance(model, Ovis2QModel):
         return prepare_dataset(format_ovis2_dataset, n_sample=20)
 
-    if isinstance(model, BaseQwen2VLGPTQ):
+    if isinstance(model, Ovis2_5QModel):
+        return prepare_dataset(format_ovis2_dataset, n_sample=20)
+
+    if isinstance(model, Ovis2_6_MoeQModel):
+        return prepare_dataset(format_ovis2_dataset, n_sample=20)
+
+    if (
+        isinstance(model, BaseQwen2VLGPTQ)
+        or isinstance(model, Qwen3_VLQModel)
+        or isinstance(model, MiniCPMOQModel)
+        or isinstance(model, MiniCPMVQModel)
+        or isinstance(model, MiniCPMV4_6QModel)
+        or isinstance(model, InternS1QModel)
+        or isinstance(model, InternVLChatQModel)
+        or isinstance(model, Ernie4_5_VLMoeQModel)
+    ):
         return prepare_dataset(format_qwen2_vl_dataset, n_sample=20)
 
     if isinstance(model, BaseQwen2_5_OmniGPTQ):
         return prepare_dataset(format_qwen2_5_omni_dataset, n_sample=20)
-
-    if isinstance(model, Qwen3_VLQModel):
-        return prepare_dataset(format_qwen2_vl_dataset, n_sample=20)
 
     raise NotImplementedError(f"Unsupported MODEL: {model.__class__}")

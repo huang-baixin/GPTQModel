@@ -11,10 +11,10 @@ from pathlib import Path
 import pytest
 import torch
 from safetensors import safe_open
-from tabulate import tabulate
 
-from gptqmodel.nn_modules.qlinear.torch_awq import AwqTorchQuantLinear
-from gptqmodel.nn_modules.qlinear.torch_fused_awq import TorchFusedAwqQuantLinear
+from gptqmodel.nn_modules.qlinear.torch_awq import AwqTorchLinear
+from gptqmodel.nn_modules.qlinear.torch_fused_awq import TorchFusedAwqLinear
+from gptqmodel.utils.logger import render_table
 from gptqmodel.utils.torch import TORCH_HAS_FUSED_OPS
 
 
@@ -117,7 +117,7 @@ def test_torch_fused_awq_matches_checkpoint_module(device_str: str):
 
     device = torch.device(device_str)
 
-    awq_module = AwqTorchQuantLinear(
+    awq_module = AwqTorchLinear(
         bits=bits,
         group_size=group_size,
         sym=True,
@@ -127,7 +127,7 @@ def test_torch_fused_awq_matches_checkpoint_module(device_str: str):
         bias=bias is not None,
         register_buffers=True,
     )
-    fused_module = TorchFusedAwqQuantLinear(
+    fused_module = TorchFusedAwqLinear(
         bits=bits,
         group_size=group_size,
         sym=True,
@@ -167,7 +167,7 @@ def test_torch_fused_awq_matches_checkpoint_module(device_str: str):
     atol = 5e-3
     abs_diff = (fused_out - baseline).abs()
     rel_diff = abs_diff / baseline.abs().clamp_min(1e-6)
-    summary = tabulate(
+    summary = render_table(
         [
             [
                 device_str,

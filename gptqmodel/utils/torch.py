@@ -4,6 +4,8 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import contextlib
+import importlib
+import os
 import time
 from contextlib import contextmanager
 from enum import Enum
@@ -68,17 +70,38 @@ except BaseException:
     # triton built from source maybe incompatible with _dynamo private api
     pass
 
-if hasattr(torch, "cuda") and hasattr(torch.cuda, "is_available") and torch.cuda.is_available():
-    HAS_CUDA = True
+try:
+    HAS_CUDA = torch.cuda.is_available()
+except Exception:
+    HAS_CUDA = False
 
-if hasattr(torch, "xpu") and hasattr(torch.xpu, "is_available") and torch.xpu.is_available():
-    HAS_XPU = True
+try:
+    HAS_XPU = torch.xpu.is_available()
+except Exception:
+    HAS_XPU = False
 
-if hasattr(torch, "mps") and hasattr(torch.mps, "is_available") and torch.mps.is_available():
-    HAS_MPS = True
+try:
+    HAS_MPS = torch.mps.is_available()
+except Exception:
+    HAS_MPS = False
 
-if hasattr(torch, "npu") and hasattr(torch.npu, "is_available") and torch.npu.is_available():
-    HAS_NPU = True
+
+def _ascend_runtime_env_ready() -> bool:
+    # torch_npu may report available before the CANN environment is fully
+    # sourced. Requiring the standard Ascend paths avoids import-time lazy
+    # initialization failures when the Python package is installed but the
+    # runtime is not usable in this shell.
+    return any(
+        os.environ.get(name)
+        for name in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME", "ASCEND_OPP_PATH")
+    )
+
+
+try:
+    importlib.import_module("torch_npu")
+    HAS_NPU = _ascend_runtime_env_ready() and torch.npu.is_available()
+except Exception:
+    HAS_NPU = False
 
 
 # mlx check
@@ -89,7 +112,11 @@ try:
 except BaseException:
     pass
 
-BACKENDS_HAS_FP32_PRECISION = hasattr(torch.backends, "fp32_precision")
+try:
+    torch.backends.fp32_precision
+    BACKENDS_HAS_FP32_PRECISION = True
+except AttributeError:
+    BACKENDS_HAS_FP32_PRECISION = False
 
 
 def _set_tf32_state(enabled: bool) -> None:
@@ -161,7 +188,7 @@ def torch_compile(module: Union[torch.nn.Module, Callable], backend:str ="induct
 
 def torch_new_stream():
     global STREAM
-    if STREAM is None:
+    if STREAM is not None:
         return STREAM
 
     if HAS_CUDA:
@@ -170,13 +197,18 @@ def torch_new_stream():
     if HAS_XPU:
         STREAM = torch.xpu.Stream()
         return STREAM
+    if HAS_NPU:
+        STREAM = torch.npu.Stream()
+        return STREAM
     return None
 
 def torch_new_stream_ctx():
     if HAS_CUDA:
         return torch.cuda.stream(torch_new_stream())
     if HAS_XPU:
-        return torch.xpu.Stream(torch_new_stream())
+        return torch.xpu.stream(torch_new_stream())
+    if HAS_NPU:
+        return torch.npu.stream(torch_new_stream())
     return contextlib.nullcontext()
 
 def torch_sync(device: torch.device = None):
@@ -197,7 +229,7 @@ def torch_sync(device: torch.device = None):
                 for idx in range(dev_count):
                     torch.cuda.synchronize(idx)
 
-        if HAS_XPU and hasattr(torch.xpu, "device_count"):
+        if HAS_XPU:
             dev_count = torch.xpu.device_count()
             if dev_count:
                 synchronized_any = True
@@ -208,7 +240,7 @@ def torch_sync(device: torch.device = None):
             synchronized_any = True
             torch.mps.synchronize()
 
-        if HAS_NPU and hasattr(torch.npu, "device_count"):
+        if HAS_NPU:
             dev_count = torch.npu.device_count()
             if dev_count:
                 synchronized_any = True
@@ -240,9 +272,9 @@ def _normalize_device(device: Union[torch.device, str, int, None]) -> Optional[t
     if isinstance(device, int):
         if HAS_CUDA and torch.cuda.device_count() > device:
             return torch.device("cuda", device)
-        if HAS_XPU and hasattr(torch.xpu, "device_count") and torch.xpu.device_count() > device:
+        if HAS_XPU and torch.xpu.device_count() > device:
             return torch.device("xpu", device)
-        if HAS_NPU and hasattr(torch.npu, "device_count") and torch.npu.device_count() > device:
+        if HAS_NPU and torch.npu.device_count() > device:
             return torch.device("npu", device)
         raise ValueError(f"Unable to map integer `{device}` to a known accelerator device.")
     raise TypeError(f"Unsupported device specifier type: {type(device)}")
@@ -252,13 +284,13 @@ def _normalize_device(device: Union[torch.device, str, int, None]) -> Optional[t
 def resolve_empty_cache_callable(device_type: str) -> Optional[Callable[[], None]]:
     try:
         if device_type == "cuda" and HAS_CUDA:
-            candidate = getattr(torch.cuda, "empty_cache", None)
+            candidate = torch.cuda.empty_cache
         elif device_type == "xpu" and HAS_XPU:
-            candidate = getattr(torch.xpu, "empty_cache", None)
+            candidate = torch.xpu.empty_cache
         elif device_type == "mps" and HAS_MPS:
-            candidate = getattr(torch.mps, "empty_cache", None)
+            candidate = torch.mps.empty_cache
         elif device_type == "npu" and HAS_NPU:
-            candidate = getattr(torch.npu, "empty_cache", None)
+            candidate = torch.npu.empty_cache
         else:
             candidate = None
     except Exception:
@@ -313,11 +345,18 @@ def empty_cache_for_device(device: torch.device) -> bool:
     return False
 
 
-def torch_empty_cache_any(device: Union[torch.device, str, int, None] = None, gc: bool = True) -> bool:
+def torch_empty_cache_any(
+    device: Union[torch.device, str, int, None] = None,
+    gc: bool = True,
+    sync: bool = False,
+) -> bool:
     normalized = _normalize_device(device)
 
     if gc:
         timed_gc_collect()
+
+    if sync:
+        torch_sync(device=normalized)
 
     success = False
 
@@ -350,8 +389,8 @@ def torch_empty_cache_any(device: Union[torch.device, str, int, None] = None, gc
     return empty_cache_for_device(normalized)
 
 
-def torch_empty_cache(device: torch.device = None, gc: bool = True) -> bool:
-    return torch_empty_cache_any(device=device, gc=gc)
+def torch_empty_cache(device: torch.device = None, gc: bool = True, sync: bool = False) -> bool:
+    return torch_empty_cache_any(device=device, gc=gc, sync=sync)
 
 def auto_select_torch_device(index: int = 0):
     assert index >= 0, f"device index should be a positive integer: actual = `{index}`"
@@ -366,6 +405,11 @@ def auto_select_torch_device(index: int = 0):
         if index > 0 and torch.xpu.device_count() <= index:
             index = 0
         device = torch.device(f"xpu:{index}")
+    elif HAS_NPU:
+        # defensive check
+        if index > 0 and torch.npu.device_count() <= index:
+            index = 0
+        device = torch.device(f"npu:{index}")
     elif HAS_MPS:
         device = torch.device("mps") # mps has no index
     else:
@@ -379,25 +423,107 @@ def torch_devices() -> List[torch.device]:
         return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
     elif HAS_XPU:
         return [torch.device(f"xpu:{i}") for i in range(torch.xpu.device_count())]
+    elif HAS_NPU:
+        return [torch.device(f"npu:{i}") for i in range(torch.npu.device_count())]
     elif HAS_MPS:
         return [torch.device("mps")]
     else:
         return [CPU]
 
+
+def npu_devices_by_pci_bus_order() -> List[torch.device]:
+    """Return visible NPU devices in torch runtime order.
+
+    Ascend exposes process-level NPU visibility through ASCEND_RT_VISIBLE_DEVICES.
+    torch-npu remaps that visible set to logical indices, so callers should set
+    the env var before process start and then use the resulting torch order.
+    """
+
+    if not HAS_NPU:
+        return []
+
+    try:
+        count = int(torch.npu.device_count())
+    except Exception:
+        return []
+    if count <= 0:
+        return []
+
+    devices: List[torch.device] = []
+    for logical_index in range(count):
+        try:
+            devices.append(torch.device("npu", logical_index))
+        except (RuntimeError, ValueError):
+            return []
+    return devices
+
+
+def last_npu_device_by_pci_bus_order() -> Optional[torch.device]:
+    """Return the last visible NPU in torch runtime order, or None when unavailable."""
+
+    devices = npu_devices_by_pci_bus_order()
+    if not devices:
+        return None
+    return devices[-1]
+
 ALL_DEVICES = torch_devices()
 
-if HAS_CUDA:
-    ALL_STREAMS = [torch.cuda.Stream(device=device) for device in ALL_DEVICES]
-elif HAS_XPU:
-    ALL_STREAMS = [torch.xpu.Stream(device=device) for device in ALL_DEVICES]
-else:
-    ALL_STREAMS = [contextlib.nullcontext()]
+
+class _LazyAcceleratorStreams:
+    """Create accelerator streams only when a caller actually needs them."""
+
+    def __init__(self, devices: List[torch.device]):
+        self._devices = devices
+        self._streams: List[Optional[object]] = [None] * len(devices)
+
+    def __len__(self):
+        return max(1, len(self._devices))
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+    def __getitem__(self, index: int):
+        if not self._devices:
+            if index == 0:
+                return contextlib.nullcontext()
+            raise IndexError(index)
+
+        stream = self._streams[index]
+        if stream is not None:
+            return stream
+
+        device = self._devices[index]
+        if device.type == "cuda":
+            stream = torch.cuda.Stream(device=device)
+        elif device.type == "xpu":
+            stream = torch.xpu.Stream(device=device)
+        elif device.type == "npu":
+            stream = torch.npu.Stream(device=device)
+        else:
+            stream = contextlib.nullcontext()
+        self._streams[index] = stream
+        return stream
+
+
+class _LazyAcceleratorStreamRef:
+    """Reference one lazy stream without materializing it at import time."""
+
+    def __init__(self, streams: _LazyAcceleratorStreams, index: int):
+        self._streams = streams
+        self._index = index
+
+    def get(self):
+        return self._streams[self._index]
+
+
+ALL_STREAMS = _LazyAcceleratorStreams(ALL_DEVICES)
 
 DEVICE_0 = auto_select_torch_device(index=0)
 # device_1 may be same as device_0 if there is only 1 visible/active device
 DEVICE_1 = auto_select_torch_device(index=1)
 
-DEVICE_0_STREAM = ALL_STREAMS[0]
+DEVICE_0_STREAM = _LazyAcceleratorStreamRef(ALL_STREAMS, 0)
 
 NEXT_DEVICE_INDEX = 0
 
@@ -422,8 +548,16 @@ NEXT_DEVICE_INDEX = 0
 #
 #     return device
 
-def torch_streamCtx(stream: Union[torch.cuda.Stream, torch.xpu.Stream]) -> StreamContext:
-    return torch.cuda.stream(stream) if HAS_CUDA else torch.xpu.stream(stream)
+def torch_streamCtx(stream) -> StreamContext:
+    if isinstance(stream, _LazyAcceleratorStreamRef):
+        stream = stream.get()
+    if HAS_CUDA:
+        return torch.cuda.stream(stream)
+    if HAS_XPU:
+        return torch.xpu.stream(stream)
+    if HAS_NPU:
+        return torch.npu.stream(stream)
+    return contextlib.nullcontext()
 
 
 @contextmanager

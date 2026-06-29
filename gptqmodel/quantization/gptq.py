@@ -21,12 +21,19 @@ from torch.nn.modules.conv import _ConvNd
 
 from ..looper.named_module import NamedModule
 from ..quantization import QuantizeConfig
-from ..quantization.config import FailSafeStrategy, SmoothMSE
+from ..quantization.config import FallbackStrategy, SmoothMSE
 from ..utils.device import get_device
 from ..utils.logger import setup_logger
 from ..utils.torch import torch_sync
-from .failsafe_smooth import mse_optimal_quant, smooth_block
-from .gar import compose_final_perm, compute_global_perm, compute_local_perms, invert_perm
+from .fallback_smooth import mse_optimal_quant, smooth_block
+from .gar import (
+    compose_final_perm,
+    compute_global_perm,
+    compute_local_perms,
+    extend_perm_with_tail,
+    invert_perm,
+)
+from .npu_linalg import npu_inverse_cholesky_factor
 from .quantizer import HF_OPTIMUM, Quantizer
 
 
@@ -136,6 +143,17 @@ def get_number_of_rows_and_cols(layer: nn.Module):
 
 
 class GPTQ:
+    @staticmethod
+    def resolve_module_source(module: nn.Module) -> nn.Module:
+        """Resolve the dense module view GPTQ should quantize for one wrapper."""
+
+        if isinstance(module, NamedModule):
+            quant_source = module.state.get("quant_source_module")
+            if isinstance(quant_source, nn.Module):
+                return quant_source
+            return module.module
+        return module
+
     def __init__(self, module: nn.Module, qcfg: Optional[QuantizeConfig] = None):
         self.lock = threading.Lock()
 
@@ -149,14 +167,15 @@ class GPTQ:
         # self.issue_non_invertible = False
 
         # self.W = module.weight
-        self.rows, self.columns = get_number_of_rows_and_cols(module)
+        resolved_module = self.resolve_module_source(module)
+        self.rows, self.columns = get_number_of_rows_and_cols(resolved_module)
         if isinstance(module, NamedModule):
-            self.module = module.module
+            self.module = resolved_module
             self.name = module.name
             self._named_module = module
         else:
             self.name = HF_OPTIMUM
-            self.module = module
+            self.module = resolved_module
             self._named_module = None
 
         self._original_rows = self.rows
@@ -188,6 +207,7 @@ class GPTQ:
         self.validate_module(self.module)
 
         self.qcfg = qcfg if qcfg else QuantizeConfig()  # HF compat will not pass qcfg
+        self._validate_act_group_aware_shape()
 
         self.module_copy = None
 
@@ -199,7 +219,7 @@ class GPTQ:
         # fwd counter
         self.fwd_counter = 0
 
-        self.failsafe = self.qcfg.failsafe
+        self.fallback = self.qcfg.fallback
         self.expected_nsamples: Optional[float] = None
 
         self.H: Optional[torch.Tensor] = None
@@ -230,6 +250,17 @@ class GPTQ:
         self._borrow_workspace_stage_dtype: Optional[torch.dtype] = None
         self._borrow_workspace_last_chunk_rows: Optional[int] = None
 
+    def _validate_act_group_aware_shape(self) -> None:
+        if not getattr(self.qcfg, "act_group_aware", False):
+            return
+
+        group_size = int(getattr(self.qcfg, "group_size", -1) or -1)
+        if group_size <= 0:
+            raise ValueError(
+                f"Quantization: Module `{self.name}` -> `act_group_aware=True` requires `group_size > 0`, "
+                f"got `{group_size}`."
+            )
+
     @staticmethod
     def validate_module(module):
         assert isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d,
@@ -253,6 +284,17 @@ class GPTQ:
         # Return identity matrix instead of complex inversion
         identity = torch.eye(H.shape[0], dtype=torch.float32, device=H.device)
         return identity, damp
+
+    def log_cpu_fallback(self, stage: str, source_device: torch.device) -> None:
+        """Explain when a memory-heavy GPTQ step moves from CUDA to CPU."""
+
+        log.warn(
+            "Quantization: Module `%s` -> CUDA OOM during %s on %s; falling back to CPU. "
+            "Due to this fallback, the calculation may take much longer than normal.",
+            self.name,
+            stage,
+            source_device,
+        )
 
     def clone_module(self, copy=True, device: torch.device = None):
         if not device:
@@ -618,13 +660,13 @@ class GPTQ:
         return torch.zeros((self.columns, self.columns), dtype=torch.float32,
                            device=self._select_hessian_target_device(target_device))
 
-    def _failsafe_quantize(self, strategy: FailSafeStrategy, blocksize: int):
+    def _fallback_quantize(self, strategy: FallbackStrategy, blocksize: int):
         """Apply a lightweight quantization fallback using the requested strategy."""
         maxq = 2 ** self.qcfg.bits - 1
         sigma = 3.0
         effective_group_size = self.qcfg.group_size if self.qcfg.group_size != -1 else self.columns
         start_time = time.time()
-        smooth_method = getattr(self.failsafe, "smooth", None)
+        smooth_method = getattr(self.fallback, "smooth", None)
         mse_steps = 32
         mse_maxshrink = 0.8
         if isinstance(smooth_method, SmoothMSE):
@@ -652,10 +694,10 @@ class GPTQ:
             else:
                 block_mod, scale_factor = smooth_block(
                     block,
-                    self.failsafe,
+                    self.fallback,
                     group_size=effective_group_size,
                 )
-                if strategy == FailSafeStrategy.MIDPOINT:
+                if strategy == FallbackStrategy.MIDPOINT:
                     w_min = block_mod.min(dim=1, keepdim=True).values
                     w_max = block_mod.max(dim=1, keepdim=True).values
                     mid = (w_max + w_min) / 2.0
@@ -666,7 +708,7 @@ class GPTQ:
                     zero = torch.round(zero_mid - (mid / scale))
                     zero = torch.clamp(zero, 0, maxq)
                     dequant = (q - zero) * scale
-                elif strategy == FailSafeStrategy.MEAN:
+                elif strategy == FallbackStrategy.MEAN:
                     mean = block_mod.mean(dim=1, keepdim=True)
                     max_dev = torch.max((block_mod - mean).abs(), dim=1, keepdim=True).values
                     max_dev = torch.clamp(max_dev, min=1e-8)
@@ -677,7 +719,7 @@ class GPTQ:
                     zero = torch.round(zero_mid - (mean / scale))
                     zero = torch.clamp(zero, 0, maxq)
                     dequant = (q - zero) * scale
-                elif strategy == FailSafeStrategy.MEDIAN:
+                elif strategy == FallbackStrategy.MEDIAN:
                     median = block_mod.median(dim=1, keepdim=True).values
                     max_dev = torch.max((block_mod - median).abs(), dim=1, keepdim=True).values
                     max_dev = torch.clamp(max_dev, min=1e-8)
@@ -688,7 +730,7 @@ class GPTQ:
                     zero = torch.round(zero_mid - (median / scale))
                     zero = torch.clamp(zero, 0, maxq)
                     dequant = (q - zero) * scale
-                elif strategy == FailSafeStrategy.STDCLIP:
+                elif strategy == FallbackStrategy.STDCLIP:
                     mean = block_mod.mean(dim=1, keepdim=True)
                     std = block_mod.std(dim=1, keepdim=True, unbiased=False)
                     std = torch.clamp(std, min=1e-8)
@@ -700,13 +742,13 @@ class GPTQ:
                     q = torch.round(block_mod / scale + zero)
                     q = torch.clamp(q, 0, maxq)
                     dequant = (q - zero) * scale
-                elif strategy == FailSafeStrategy.RTN:
+                elif strategy == FallbackStrategy.RTN:
                     self.quantizer.find_params(block_mod, weight=True)
                     dequant = self.quantizer.quantize(block_mod)
                     scale = self.quantizer.scale
                     zero = self.quantizer.zero
                 else:
-                    raise ValueError(f"Unsupported failsafe strategy: {strategy}")
+                    raise ValueError(f"Unsupported fallback strategy: {strategy}")
 
                 if scale_factor is not None:
                     scale = scale * scale_factor
@@ -748,7 +790,7 @@ class GPTQ:
         Q = Q.to(device=self.module.weight.data.device, non_blocking=False)
         mean_abs_err = (Q - self.module.weight.data).abs().mean().item()
         duration = time.time() - start_time
-        avg_loss = f"failsafe({strategy.value}): {mean_abs_err:.7f}"
+        avg_loss = f"fallback({strategy.value}): {mean_abs_err:.7f}"
         damp = 0.0
 
         self.H = None
@@ -833,10 +875,13 @@ class GPTQ:
             while 0 < damp < 1:
                 try:
                     diag_view.add_(damp * mean)
-                    H2 = torch.linalg.cholesky(H)
-                    Hinv_result = torch.linalg.cholesky(torch.cholesky_inverse(H2), upper=True)
+                    if H.device.type == "npu":
+                        Hinv_result = npu_inverse_cholesky_factor(H)
+                    else:
+                        H2 = torch.linalg.cholesky(H)
+                        Hinv_result = torch.linalg.cholesky(torch.cholesky_inverse(H2), upper=True)
+                        del H2
                     diag_view.copy_(current_diag)
-                    del H2
                     used_damp = damp
                     if damp_recovery_started:
                         log.warn(
@@ -886,28 +931,30 @@ class GPTQ:
         start = time.time()
 
         target_device = getattr(self.module, "target_device", None)
-        from ..utils.failsafe import resolve_failsafe_strategy, resolve_threshold, should_use_failsafe
+        result_device = torch.device(self.module.weight.data.device)
+        cpu_fallback_used = False
+        from ..utils.fallback import resolve_fallback_strategy, resolve_threshold, should_use_fallback
 
-        resolved_strategy = resolve_failsafe_strategy(self.failsafe)
-        fallback_requested = should_use_failsafe(
-            self.failsafe,
+        resolved_strategy = resolve_fallback_strategy(self.fallback)
+        fallback_requested = should_use_fallback(
+            self.fallback,
             float(self.nsamples),
             self.expected_nsamples,
         )
-        threshold_raw, is_percent = resolve_threshold(self.failsafe, self.expected_nsamples)
-        failsafe_configured = threshold_raw is not None
+        threshold_raw, is_percent = resolve_threshold(self.fallback, self.expected_nsamples)
+        fallback_configured = threshold_raw is not None
 
         if fallback_requested:
             use_hessian = False
-            threshold_text = str(getattr(self.failsafe, "threshold", None))
+            threshold_text = str(getattr(self.fallback, "threshold", None))
             threshold_info = f", threshold_raw={threshold_raw}" if threshold_raw is not None and is_percent else ""
             log.warn(
                 f"Quantization: Module `{self.name}` -> "
-                f"Using `{resolved_strategy.value}` failsafe quantization (observed {self.nsamples} samples, threshold={threshold_text}{threshold_info}, max_total={self.expected_nsamples})."
+                f"Using `{resolved_strategy.value}` fallback quantization (observed {self.nsamples} samples, threshold={threshold_text}{threshold_info}, max_total={self.expected_nsamples})."
             )
             self.H = self.create_H(target_device=target_device)
 
-            return self._failsafe_quantize(resolved_strategy, blocksize)
+            return self._fallback_quantize(resolved_strategy, blocksize)
         else:
             use_hessian = True
             self.finalize_hessian(target_device=target_device)
@@ -964,8 +1011,20 @@ class GPTQ:
 
         if self.qcfg.desc_act and use_hessian:
             perm = torch.argsort(torch.diag(self.H), descending=True)
-            W = W[:, perm]
-            self.H = self.H[perm][:, perm]
+            try:
+                W = W[:, perm]
+                self.H = self.H[perm][:, perm]
+            except RuntimeError as exc:
+                if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
+                    raise
+
+                self.log_cpu_fallback("Hessian permutation", self.H.device)
+                cpu_fallback_used = True
+                cpu_device = torch.device("cpu")
+                perm = perm.to(device=cpu_device)
+                W = W.to(device=cpu_device)[:, perm]
+                self.H = self.H.to(device=cpu_device)[perm][:, perm]
+                self.quantizer.find_params(W, weight=True)
             invperm = torch.argsort(perm)
 
         elif self.qcfg.act_group_aware and use_hessian:
@@ -980,16 +1039,43 @@ class GPTQ:
             )
             del local_values
             final_perm = compose_final_perm(local_perms, global_perm, self.qcfg.group_size)
-            W = W[:, final_perm]
-            self.H = self.H[final_perm][:, final_perm]
+            final_perm = extend_perm_with_tail(final_perm, self.columns)
+            try:
+                W = W[:, final_perm]
+                self.H = self.H[final_perm][:, final_perm]
+            except RuntimeError as exc:
+                if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
+                    raise
+
+                self.log_cpu_fallback("act-group Hessian permutation", self.H.device)
+                cpu_fallback_used = True
+                cpu_device = torch.device("cpu")
+                final_perm = final_perm.to(device=cpu_device)
+                W = W.to(device=cpu_device)[:, final_perm]
+                self.H = self.H.to(device=cpu_device)[final_perm][:, final_perm]
+                self.quantizer.find_params(W, weight=True)
+
+        if use_hessian:
+            try:
+                Hinv, damp = self.hessian_inverse(self.H)
+            except RuntimeError as exc:
+                if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
+                    raise
+
+                # Full-attention blocks on very large models can exceed GPU memory during the
+                # dense Hessian inverse; finish that module on CPU instead of aborting the run.
+                self.log_cpu_fallback("Hessian inverse", self.H.device)
+                cpu_fallback_used = True
+                cpu_device = torch.device("cpu")
+                self.H = self.H.to(device=cpu_device)
+                W = W.to(device=cpu_device)
+                self.quantizer.find_params(W, weight=True)
+                Hinv, damp = self.hessian_inverse(self.H)
+        else:
+            Hinv, damp = None, 0.0
 
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
-
-        if use_hessian:
-            Hinv, damp = self.hessian_inverse(self.H)
-        else:
-            Hinv, damp = None, 0.0
 
         # Use simplified loop when mock_quantization is active
         if self.qcfg.mock_quantization:
@@ -1157,20 +1243,20 @@ class GPTQ:
 
                 if math.isnan(avg_loss):
                     print("Losses sum item:", torch.sum(Losses).item())
-                    if failsafe_configured:
+                    if fallback_configured:
                         log.info(f"Quantization: Failed due to `NaN` loss for `{self.name}`, use mock quantization retry for `{self.name}`")
                         self.qcfg.mock_quantization = True
                         return self.quantize(blocksize=blocksize)
                     else:
-                        raise ValueError(f"Quantization: Failed due to `NaN` loss for `{self.name}`, please try increasing calibration data samples or enable failsafe=True")
+                        raise ValueError(f"Quantization: Failed due to `NaN` loss for `{self.name}`, please try increasing calibration data samples or enable fallback=True")
             else:
-                if failsafe_configured:
+                if fallback_configured:
                     log.warn(f"Quantization: Module `{self.name}` -> using fail safe mode. Please check if calibration data is sufficient.")
                 else:
                     log.warn(f"Quantization: `{self.name}` is not activated due to model inference logic (MoE)")
-                avg_loss = f"{resolved_strategy.value} failsafe" if failsafe_configured else 999999999
+                avg_loss = f"{resolved_strategy.value} fallback" if fallback_configured else 999999999
         else:
-            avg_loss = f"{resolved_strategy.value} failsafe" if failsafe_configured else 999999999
+            avg_loss = f"{resolved_strategy.value} fallback" if fallback_configured else 999999999
 
         del Losses
         del self.H
@@ -1186,18 +1272,22 @@ class GPTQ:
         g_idx = torch.tensor(g_idx, dtype=torch.int32, device=Q.device)
 
         if self.qcfg.desc_act and use_hessian:
+            invperm = invperm.to(device=Q.device)
             Q = Q[:, invperm]
             g_idx = g_idx[invperm]
             del perm, invperm
 
         elif self.qcfg.act_group_aware and use_hessian:
-            inv_final = invert_perm(final_perm)
+            inv_final = invert_perm(final_perm).to(device=Q.device)
             Q = Q[:, inv_final]
             inv_global_perm = invert_perm(global_perm)
             inv_global_perm_list = inv_global_perm.tolist()
+            reordered_group_count = len(inv_global_perm_list)
             temp_scale = [scale[i] for i in inv_global_perm_list]
+            temp_scale.extend(scale[reordered_group_count:])
             scale = temp_scale
             temp_zero = [zero[i] for i in inv_global_perm_list]
+            temp_zero.extend(zero[reordered_group_count:])
             zero = temp_zero
             del final_perm, inv_final, global_perm, inv_global_perm, inv_global_perm_list, local_perms
 
@@ -1226,7 +1316,14 @@ class GPTQ:
             scale = self.truncate_last_dim(scale, valid_cols)
             zero = self.truncate_last_dim(zero, valid_cols)
 
-        Q = Q.to(device=self.module.weight.data.device, non_blocking=False)
+        if cpu_fallback_used and Q.device != result_device:
+            log.info(
+                "Quantization: Module `%s` -> CPU fallback complete; moving final quantized weights back to %s.",
+                self.name,
+                result_device,
+            )
+
+        Q = Q.to(device=result_device, non_blocking=False)
 
         duration = time.time() - start
 
